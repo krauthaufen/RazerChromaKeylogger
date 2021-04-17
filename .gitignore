@@ -1,0 +1,6 @@
+/.vs/
+/publish/
+/KeyStats/
+obj/
+bin/
+*.user
