@@ -100,6 +100,7 @@ open Colore.Effects.Keyboard
 open System.Globalization
 open System.Threading
 open Aardvark.Base
+open System.Collections.Concurrent
 
 module Translations =
     let toRazer =
@@ -254,15 +255,53 @@ module Translations =
 
     let tryGetRazerKey (k : Keys) =
         match toRazer.TryGetValue k with
-        | (true, r) -> Some r
+        | (true, r) when int r <> 0 -> Some r
         | _ -> None
+
+module ConcurrentDictionary =
+    let toArray (d : ConcurrentDictionary<'a, 'b>) =
+        let res = Array.zeroCreate d.Count
+        use e = d.GetEnumerator()
+        let mutable i = 0
+        while e.MoveNext() && i < res.Length do 
+            let kvp = e.Current
+            res.[i] <- kvp.Key, kvp.Value
+            i <- i + 1
+
+        if i < res.Length then Array.take i res
+        else res
 
 type MyApp(init : unit -> unit) =
     inherit ApplicationContext()
 
     do init()
 
+type MyItem(table : TableLayoutPanel) =
+    inherit ToolStripControlHost(table)
 
+    override x.GetPreferredSize(constrainTo) =
+        constrainTo
+
+type MyToolStripRenderer() =
+    inherit ToolStripRenderer()
+
+    override x.OnRenderItemText(e : ToolStripItemTextRenderEventArgs) =
+        if e.Item.Selected then
+            //let ne = ToolStripItemTextRenderEventArgs(e.Graphics, e.Item, e.Text, e.TextRectangle, Drawing.Color.Green, e.TextFont, Drawing.ContentAlignment.TopLeft)
+            //base.OnRenderItemText(e)
+            //let pt = Drawing.PointF(float32 e.TextRectangle.X, float32 e.TextRectangle.Y)
+            //e.Graphics.DrawString(e.Text, e.TextFont, Drawing.Brushes.Black, pt)
+            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, e.TextRectangle, Drawing.Color.White, e.TextFormat)
+        else
+            base.OnRenderItemText(e)
+
+    override x.OnRenderButtonBackground(e : ToolStripItemRenderEventArgs) =
+        base.OnRenderButtonBackground(e)
+        if e.Item.Selected then
+            let color = Drawing.Color.FromArgb(255, 50, 50, 50)
+            let rect = Drawing.Rectangle(0,0, e.Item.GetCurrentParent().Size.Width, e.Item.Size.Height)
+            e.Graphics.FillRectangle(new Drawing.SolidBrush(color), rect)
+            
 
 
 [<EntryPoint; STAThread>]
@@ -343,7 +382,7 @@ let main argv =
     let mutable maxCount = 0
     let mutable total = 0
     let mutable lastSave = 0
-    let counts = System.Collections.Generic.Dictionary<Key, int>()
+    let counts = ConcurrentDictionary<Key, int>()
 
 
 
@@ -360,7 +399,7 @@ let main argv =
         lastSave <- total
         let b = System.Text.StringBuilder()
         b.AppendLine(sprintf "# total: %d" total) |> ignore
-        for (k, v) in counts |> Dictionary.toArray |> Array.sortBy snd do
+        for (k, v) in counts |> ConcurrentDictionary.toArray |> Array.sortBy snd do
             b.AppendLine(sprintf "%A;%d" k v) |> ignore
         File.writeAllText file (b.ToString())
 
@@ -398,11 +437,9 @@ let main argv =
         User32.setHook (fun k ->
             match Translations.tryGetRazerKey k with
             | Some k ->
-                let mutable o = 0
-                if not (counts.TryGetValue(k, &o)) then o <- 0
-                counts.[k] <- o + 1
+                let newCount = counts.AddOrUpdate(k, 1, fun _ o -> o + 1)
                 if not (Set.contains k excluded) then
-                    maxCount <- max maxCount (o + 1)
+                    maxCount <- max maxCount newCount
                 total <- total + 1
             | _ ->
                 ()
@@ -417,47 +454,98 @@ let main argv =
     let icon = new NotifyIcon()
     let menu = new ContextMenuStrip()
     let close = new ToolStripButton("Close KeyLogger")
+    //close.AutoSize <- false
+    //close.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+    close.AutoToolTip <- false
+    close.ToolTipText <- "Closes KeyLogger and saves the current stats"
+    //close.TextAlign <- Drawing.ContentAlignment.MiddleLeft
     let s1 = new ToolStripLabel("total: 0")
-    let s2 = new ToolStripLabel("")
-    let s3 = new ToolStripLabel("")
-    let s4 = new ToolStripLabel("")
+    let original = s1.Font
+    s1.Font <- new Drawing.Font(original.FontFamily, 14.0f, Drawing.FontStyle.Bold)
 
-    let lines = 8 //[|s2;s3;s4|]
-
-    let font = new Drawing.Font(s1.Font, Drawing.FontStyle.Bold)
-    let elems = 
-        Array.init lines (fun _ ->
-            let l = new ToolStripLabel("")
-            l.Font <- font
-            l
-        )
+    let font = new Drawing.Font(original, Drawing.FontStyle.Bold)
+    //let elems = 
+    //    Array.init lines (fun _ ->
+    //        let l = new ToolStripLabel("")
+    //        l.Font <- font
+    //        l
+    //    )
 
     close.Click.Add (fun _ -> Application.Exit())
     
-    
+    menu.RenderMode <- ToolStripRenderMode.Professional
+    menu.Renderer <- MyToolStripRenderer()
     menu.Items.Add(s1) |> ignore
     menu.Items.Add(new ToolStripSeparator()) |> ignore
-    for e in elems do
-        menu.Items.Add e |> ignore
+
+    //table.Dock <- DockStyle.Fill
+
+    let tablePos = menu.Items.Add(new ToolStripSeparator())
+
     menu.Items.Add(new ToolStripSeparator()) |> ignore
+
+
+
+    let countString (c : int) =
+        if c >= 1000000 then  sprintf "%.2fM" (float c / 1000000.0)
+        elif c > 2000 then sprintf "%.1fk" (float c / 1000.0)
+        else string c
+
     menu.Items.Add(close) |> ignore
 
     menu.Opening.Add (fun _ ->
-        s1.Text <- sprintf "%d keys pressed" total
+        s1.Text <- sprintf "%s keystrokes" (countString total)
+        let values = counts |> ConcurrentDictionary.toArray |> Array.sortByDescending snd
+        let cnt = values.Length
 
-        let values = counts |> Dictionary.toArray |> Array.sortByDescending snd |> Array.filter (fun (k,_) -> not (Set.contains k excluded))
-        for i in 0 .. lines - 1 do
+        let table = new TableLayoutPanel()
+        table.ColumnCount <- 2
+        table.RowCount <- cnt
+        table.MaximumSize <- Drawing.Size(1024, 300)
+        //table.Dock <- DockStyle.Fill
+        table.GrowStyle <- TableLayoutPanelGrowStyle.FixedSize
+        table.AutoScroll <- true
+        table.HorizontalScroll.Enabled <- false
+        table.HorizontalScroll.Visible <- false
+        table.Height <- table.GetRowHeights().[0] * 8
+        for i in 0 .. cnt - 1 do
             if i < values.Length then
                 let (k, c) = values.[i]
-                elems.[i].Visible <- true
-                elems.[i].Text <- sprintf "%A: %d" k c
-            else
-                elems.[i].Visible <- false
+
+                let keyName = 
+                    let keyName = string k
+                    if keyName.StartsWith "Oem" then keyName.Substring 3
+                    else keyName
+
+                let header = new Label(Text = keyName)
+                let value = new Label(Text = countString c)
+                
+                header.TextAlign <- Drawing.ContentAlignment.MiddleRight
+                value.TextAlign <- Drawing.ContentAlignment.MiddleLeft
+                value.Font <- font
+                table.Controls.Add header
+                table.Controls.Add value
+                table.SetCellPosition(header, TableLayoutPanelCellPosition(0, i))
+                table.SetCellPosition(value, TableLayoutPanelCellPosition(1, i))
+              
+        
+        table.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 10.0f)) |> ignore
+        table.ColumnStyles.Add(ColumnStyle(SizeType.AutoSize, 80.0f)) |> ignore
+        menu.Items.RemoveAt(tablePos)
+        menu.Items.Insert(tablePos, new ToolStripControlHost(table))
+
     )
 
+    menu.BackColor <- Drawing.Color.FromArgb(255, 30, 30, 30)
+    menu.ForeColor <- Drawing.Color.FromArgb(255, 220, 220, 220)
+    menu.ShowImageMargin <- false
+    
+    
     icon.Icon <- ico
     icon.ContextMenuStrip <- menu
     icon.Visible <- true
+    
+
     Application.ApplicationExit.Add (fun _ -> 
         icon.Visible <- false
         api.UninitializeAsync().Wait()
